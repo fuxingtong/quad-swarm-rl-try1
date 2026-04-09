@@ -35,35 +35,61 @@ def parse_contract_net_cfg(argv=None):
                         help='Task allocation algorithm to use')
     cfg = parse_full_cfg(parser, argv)
 
-    # 强制与训练时一致的配置
-    cfg.quads_mode = "o_random"
+    # -------------------------- 核心修改 1：强制对齐训练时的参数 --------------------------
+    # 环境模式（与训练一致）
+    cfg.quads_mode = "o_static_diff_goal"  # 原来是 "o_random"，改为训练时的模式
     cfg.quads_render = True
     cfg.quads_use_obstacles = True
     cfg.quads_obst_density = 0.2
     cfg.quads_obst_size = 0.6
     cfg.quads_obst_spawn_area = [8.0, 8.0]
     cfg.quads_obs_repr = "xyz_vxyz_R_omega_floor"
-    cfg.quads_neighbor_visible_num = 2
+
+    # 邻居观测（与训练一致：visible_num=5, encoder_type=attention）
+    cfg.quads_neighbor_visible_num = 5  # 原来是 2
     cfg.quads_neighbor_obs_type = "pos_vel"
+    cfg.quads_neighbor_encoder_type = "attention"  # 新增：训练时用了 attention 编码器
+
     cfg.quads_use_downwash = True
     cfg.quads_obstacle_obs_type = "octomap"
     cfg.quads_num_agents = 6
     cfg.env_gpu_observations = False
     cfg.device = "cpu"
-    cfg.use_rnn = True
+
+    # 模型结构（与训练一致）
+    cfg.use_rnn = False  # 原来是 True，训练时 use_rnn=False
+    cfg.actor_critic_share_weights = False  # 新增：训练时非共享权重
+    cfg.nonlinearity = "tanh"  # 新增：训练时的激活函数
+    cfg.policy_initialization = "xavier_uniform"  # 新增
+    cfg.adaptive_stddev = False  # 新增
+    cfg.normalize_input = False  # 新增：训练时未归一化输入
+    cfg.normalize_returns = False  # 新增：训练时未归一化回报
+    cfg.rnn_size = 256  # 虽然不用 RNN，但保持参数存在
+
     return cfg
 
 
 def load_policy(cfg, env, checkpoint_path):
+    """修改后的模型加载函数，确保与训练结构一致"""
     obs_space = env.observation_space
     if not isinstance(obs_space, spaces.Dict):
         obs_space = spaces.Dict({"obs": obs_space})
+
+    # -------------------------- 核心修改 2：创建与训练一致的模型 --------------------------
+    # 注意：create_actor_critic 内部会根据 cfg.actor_critic_share_weights 选择是否共享权重
     actor_critic = create_actor_critic(cfg, obs_space, env.action_space)
     actor_critic.eval()
+
     device = torch.device(cfg.device)
     actor_critic.model_to_device(device)
-    checkpoint_dict = torch.load(checkpoint_path, map_location=device)
-    actor_critic.load_state_dict(checkpoint_dict["model"])
+
+    # 加载权重（添加 weights_only=False 避免警告，同时保持兼容性）
+    checkpoint_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # -------------------------- 核心修改 3：严格加载权重 --------------------------
+    # 使用 strict=True 确保结构完全匹配，有问题直接报错便于调试
+    actor_critic.load_state_dict(checkpoint_dict["model"], strict=True)
+
     print(f"Loaded policy from {checkpoint_path}")
     return actor_critic, device
 
@@ -118,7 +144,10 @@ def main():
     total_steps = 0
     max_steps = 20000
     episode_done = False
-    rnn_states = torch.zeros((num_agents, cfg.rnn_size), device=device) if cfg.use_rnn else None
+
+    # -------------------------- 核心修改 4：RNN 状态处理 --------------------------
+    # 因为训练时 use_rnn=False，这里设为 None
+    rnn_states = None
 
     last_print_step = 0
     print_interval = 500
@@ -144,10 +173,11 @@ def main():
         obs_dict = {"obs": obs}
         normalized_obs = prepare_and_normalize_obs(model, obs_dict)
         with torch.no_grad():
+            # 传入 rnn_states=None（因为训练时没有 RNN）
             result = model.forward(normalized_obs, rnn_states, values_only=False)
         actions = result["actions"].cpu().numpy()
-        if cfg.use_rnn:
-            rnn_states = result["new_rnn_states"]
+
+        # 不再更新 rnn_states
 
         # 执行环境步
         step_result = env.step(actions)
